@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+from scipy.optimize import linear_sum_assignment  # Used to align estimated components with true components
 
 # Page configuration for Streamlit Cloud
 st.set_page_config(
@@ -62,7 +63,7 @@ cov_type = st.sidebar.selectbox(
     "EM Covariance Structure",
     options=["Full", "Diagonal", "Spherical"],
     index=0,
-    help="• Full: Arbitrary rotation and variances (3 params/component)\n• Diagonal: Axis-aligned variances (2 params/component)\n• Spherical: Equal variances along both axes (1 param/component)"
+    help="• Full: Arbitrary rotation and variances\n• Diagonal: Axis-aligned variances\n• Spherical: Equal variances along both axes"
 )
 
 # --- GENERATION FUNCTION ---
@@ -85,7 +86,7 @@ def generate_gmm_data(N_val, K_val, pi_vec, means_list, covs_list, random_seed):
 
 df_gen, X_mat, z_true = generate_gmm_data(N, K, pi_true, means_true, covs_true, seed)
 
-# --- EM ALGORITHM WITH COVARIANCE CONSTRAINTS ---
+# --- EM ALGORITHM WITH COMPONENT ALIGNMENT ---
 def gaussian_pdf_2d(x, mean, cov):
     d = 2
     det = max(np.linalg.det(cov), 1e-6)
@@ -95,7 +96,42 @@ def gaussian_pdf_2d(x, mean, cov):
     exponent = -0.5 * np.sum(diff @ inv * diff, axis=1)
     return norm_const * np.exp(exponent)
 
-def run_em_steps(X, K, max_iter=25, constraint="Full"):
+def align_components_with_true_means(means_hat, covs_hat, pi_hat, gamma, means_true):
+    """
+    Solves the bipartite matching problem using the Hungarian algorithm 
+    to map each estimated cluster index to the closest true cluster index based on mean Euclidean distance.
+    """
+    K = len(means_true)
+    cost_matrix = np.zeros((K, K))
+    
+    # Cost matrix based on Euclidean distance between estimated and true means
+    for i in range(K):
+        for j in range(K):
+            cost_matrix[i, j] = np.linalg.norm(means_hat[i] - np.array(means_true[j]))
+            
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    
+    # Reorder parameters based on optimal matching
+    aligned_means = [means_hat[i] for i in row_ind]
+    aligned_covs = [covs_hat[i] for i in row_ind]
+    aligned_pi = pi_hat[row_ind]
+    aligned_gamma = gamma[:, row_ind]
+    
+    # Ensure mapping translates row_ind -> col_ind ordering
+    permuted_means = [None] * K
+    permuted_covs = [None] * K
+    permuted_pi = np.zeros(K)
+    permuted_gamma = np.zeros_like(gamma)
+    
+    for est_idx, true_idx in zip(row_ind, col_ind):
+        permuted_means[true_idx] = means_hat[est_idx]
+        permuted_covs[true_idx] = covs_hat[est_idx]
+        permuted_pi[true_idx] = pi_hat[est_idx]
+        permuted_gamma[:, true_idx] = gamma[:, est_idx]
+        
+    return permuted_means, permuted_covs, permuted_pi, permuted_gamma
+
+def run_em_steps(X, K, max_iter=25, constraint="Full", means_true_ref=None):
     N = X.shape[0]
     np.random.seed(seed + 100) # Distinct seed for EM initialization
     
@@ -118,12 +154,20 @@ def run_em_steps(X, K, max_iter=25, constraint="Full"):
         
         log_likelihood = np.sum(np.log(sum_gamma_safe))
         
+        # Perform component alignment with ground truth
+        if means_true_ref is not None:
+            a_means, a_covs, a_pi, a_gamma = align_components_with_true_means(
+                means_hat, covs_hat, pi_hat, gamma, means_true_ref
+            )
+        else:
+            a_means, a_covs, a_pi, a_gamma = means_hat.copy(), covs_hat.copy(), pi_hat.copy(), gamma.copy()
+
         history.append({
             "iteration": iteration,
-            "pi": pi_hat.copy(),
-            "means": [m.copy() for m in means_hat],
-            "covs": [c.copy() for c in covs_hat],
-            "gamma": gamma.copy(),
+            "pi": a_pi,
+            "means": a_means,
+            "covs": a_covs,
+            "gamma": a_gamma,
             "log_likelihood": log_likelihood
         })
         
@@ -138,21 +182,19 @@ def run_em_steps(X, K, max_iter=25, constraint="Full"):
             
             # Apply Covariance Constraint
             if constraint == "Diagonal":
-                # Zero out off-diagonal elements
                 covs_hat[k] = np.diag(np.diag(raw_cov))
             elif constraint == "Spherical":
-                # Average diagonal elements across dimensions
                 avg_var = np.mean(np.diag(raw_cov))
                 covs_hat[k] = np.eye(2) * avg_var
             else: # Full
                 covs_hat[k] = raw_cov
                 
-            covs_hat[k] += np.eye(2) * 1e-4 # Regularization for numerical stability
+            covs_hat[k] += np.eye(2) * 1e-4 # Regularization
             
     return history
 
 max_em_steps = st.sidebar.slider("Max EM Iterations", min_value=1, max_value=40, value=20)
-em_history = run_em_steps(X_mat, K, max_iter=max_em_steps, constraint=cov_type)
+em_history = run_em_steps(X_mat, K, max_iter=max_em_steps, constraint=cov_type, means_true_ref=means_true)
 
 # Select Iteration Step
 current_step = st.slider("Step Through EM Iterations", min_value=0, max_value=len(em_history)-1, value=len(em_history)-1)
@@ -194,11 +236,15 @@ st.subheader("2. Visual Comparison: True Generation vs. EM Recovery")
 
 col_left, col_right = st.columns(2)
 
+# Color Mapping for strict alignment
+color_sequence = px.colors.qualitative.Plotly
+
 # LEFT COLUMN: ORIGINAL SAMPLING
 with col_left:
     st.markdown("#### A. Original Sampling (Ground Truth)")
     fig_true = px.scatter(
         df_gen, x="x1", y="x2", color="True Cluster (z_i)",
+        color_discrete_sequence=color_sequence,
         title="True Latent Cluster Assignments z_i", opacity=0.75
     )
     for k in range(K):
@@ -219,12 +265,13 @@ with col_right:
     df_em = pd.DataFrame({
         "x1": X_mat[:, 0],
         "x2": X_mat[:, 1],
-        "Inferred Cluster": [f"Est. Component {k+1}" for k in hard_assignments]
+        "Inferred Cluster": [f"Component {k+1}" for k in hard_assignments]
     })
     
     fig_em = px.scatter(
         df_em, x="x1", y="x2", color="Inferred Cluster",
-        title=f"Inferred Clusters (Max Responsibility γ_{{i,k}})", opacity=0.75
+        color_discrete_sequence=color_sequence,
+        title=f"Inferred Clusters (Aligned to Matching True Components)", opacity=0.75
     )
     for k in range(K):
         fig_em.add_trace(go.Scatter(
