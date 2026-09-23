@@ -4,25 +4,23 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 
-# Page configuration for Cloud
+# Page configuration for Streamlit Cloud
 st.set_page_config(
-    page_title="GMM Generative & EM Interactive Demo",
-    page_icon="🎲",
+    page_title="GMM: Generative Process vs EM Algorithm",
+    page_icon="📊",
     layout="wide"
 )
 
-st.title("🎲 GMM Generative Process & Expectation-Maximization (EM)")
+st.title("📊 GMM: Ground Truth Sampling vs. EM Algorithm")
 st.markdown("""
-This demo connects **Data Generation** with **Unsupervised Fitting**:
-1. **Generative Phase:** Sample data $\mathbf{x}_i \sim \sum_k \pi_k \mathcal{N}(\boldsymbol{\mu}_k, \mathbf{\Sigma}_k)$ with known latent parameters.
-2. **Inference Phase (EM):** Hide the true labels and run EM step-by-step to recover parameters $(\hat{\boldsymbol{\pi}}, \hat{\boldsymbol{\mu}}, \hat{\mathbf{\Sigma}})$.
+Compare the **true generative model** against the **Expectation-Maximization (EM)** inference process, and observe how the **incomplete log-likelihood** evolves over iterations.
 """)
 
 # --- SIDEBAR: PARAMETERS ---
 st.sidebar.header("1. Generative Ground Truth")
 
-N = st.sidebar.slider("Number of Data Points (N)", min_value=50, max_value=1000, value=300, step=50)
-K = st.sidebar.slider("Number of Components (K)", min_value=2, max_value=4, value=3, step=1)
+N = st.sidebar.slider("Number of Data Points (N)", min_value=100, max_value=1500, value=400, step=50)
+K = st.sidebar.slider("Number of Components (K)", min_value=2, max_value=5, value=3, step=1)
 seed = st.sidebar.number_input("Random Seed", value=42, step=1)
 
 st.sidebar.markdown("---")
@@ -78,21 +76,19 @@ df_gen, X_mat, z_true = generate_gmm_data(N, K, pi_true, means_true, covs_true, 
 
 # --- EM ALGORITHM IMPLEMENTATION ---
 def gaussian_pdf_2d(x, mean, cov):
-    """Calculates 2D multivariate Gaussian density."""
     d = 2
-    det = np.linalg.det(cov)
+    det = max(np.linalg.det(cov), 1e-6)
     inv = np.linalg.inv(cov)
-    norm_const = 1.0 / (2.0 * np.pi ** (d / 2.0) * np.sqrt(max(det, 1e-6)))
+    norm_const = 1.0 / (2.0 * np.pi ** (d / 2.0) * np.sqrt(det))
     diff = x - mean
     exponent = -0.5 * np.sum(diff @ inv * diff, axis=1)
     return norm_const * np.exp(exponent)
 
-def run_em_steps(X, K, max_iter=20):
-    """Runs EM and saves history at each step for step-by-step visualization."""
+def run_em_steps(X, K, max_iter=25):
     N = X.shape[0]
-    np.random.seed(seed + 1)
+    np.random.seed(seed + 100) # Distinct seed for EM initialization
     
-    # Random Initialization
+    # K-Means style or random initial centroids
     pi_hat = np.ones(K) / K
     random_indices = np.random.choice(N, K, replace=False)
     means_hat = X[random_indices].copy()
@@ -101,20 +97,18 @@ def run_em_steps(X, K, max_iter=20):
     history = []
     
     for iteration in range(max_iter):
-        # E-STEP: Compute Responsibilities gamma_{i, k} = P(z_i = k | x_i)
+        # E-step
         gamma = np.zeros((N, K))
         for k in range(K):
             gamma[:, k] = pi_hat[k] * gaussian_pdf_2d(X, means_hat[k], covs_hat[k])
         
-        # Normalize over components (sum over k = 1)
         sum_gamma = np.sum(gamma, axis=1, keepdims=True)
-        sum_gamma[sum_gamma == 0] = 1e-10  # Numerical stability
-        gamma = gamma / sum_gamma
+        sum_gamma_safe = np.where(sum_gamma == 0, 1e-10, sum_gamma)
+        gamma = gamma / sum_gamma_safe
         
-        # Calculate Log-Likelihood
-        log_likelihood = np.sum(np.log(sum_gamma))
+        # Log-Likelihood
+        log_likelihood = np.sum(np.log(sum_gamma_safe))
         
-        # Save snapshot before M-Step update
         history.append({
             "iteration": iteration,
             "pi": pi_hat.copy(),
@@ -124,95 +118,116 @@ def run_em_steps(X, K, max_iter=20):
             "log_likelihood": log_likelihood
         })
         
-        # M-STEP: Update Parameters using Responsibilities
+        # M-step
         N_k = np.sum(gamma, axis=0)
-        
         for k in range(K):
-            # Update Pi
             pi_hat[k] = N_k[k] / N
-            
-            # Update Mean
-            means_hat[k] = np.sum(gamma[:, k, None] * X, axis=0) / N_k[k]
-            
-            # Update Covariance Matrix
+            means_hat[k] = np.sum(gamma[:, k, None] * X, axis=0) / max(N_k[k], 1e-6)
             diff = X - means_hat[k]
-            covs_hat[k] = (diff.T @ (gamma[:, k, None] * diff)) / N_k[k]
-            # Ensure positive definiteness
-            covs_hat[k] += np.eye(2) * 1e-4
+            covs_hat[k] = (diff.T @ (gamma[:, k, None] * diff)) / max(N_k[k], 1e-6)
+            covs_hat[k] += np.eye(2) * 1e-4 # Regularization
             
     return history
 
-# --- EM EXECUTION ---
-st.markdown("---")
-st.header("3. Expectation-Maximization (EM) Execution")
-
-max_em_steps = st.slider("Max EM Iterations", min_value=1, max_value=30, value=15)
+max_em_steps = st.sidebar.slider("Max EM Iterations", min_value=1, max_value=40, value=20)
 em_history = run_em_steps(X_mat, K, max_iter=max_em_steps)
 
 # Select Iteration Step
-current_step = st.slider("Step Through EM Iterations", min_value=0, max_value=len(em_history)-1, value=0)
+current_step = st.slider("Step Through EM Iterations", min_value=0, max_value=len(em_history)-1, value=len(em_history)-1)
 step_data = em_history[current_step]
 
-# --- EM METRICS DISPLAY ---
-col_m1, col_m2, col_m3 = st.columns(3)
-col_m1.metric("Current Iteration", f"Step {step_data['iteration']}")
-col_m2.metric("Log-Likelihood", f"{step_data['log_likelihood']:.2f}")
+# --- SECTION 1: LIKELIHOOD EVOLUTION ---
+st.subheader("1. Incomplete Log-Likelihood Evolution: $\\log P(\\mathbf{X} \\mid \\boldsymbol{\\theta})$")
 
-# Measure Convergence
-if current_step > 0:
-    ll_diff = step_data['log_likelihood'] - em_history[current_step-1]['log_likelihood']
-    col_m3.metric("Log-Likelihood Improvement", f"+{ll_diff:.4f}")
-else:
-    col_m3.metric("Log-Likelihood Improvement", "N/A (Initial Step)")
+col_ll1, col_ll2 = st.columns([2, 1])
 
-# --- VISUALIZING EM RESPONSIBILITIES & ESTIMATED MEANS ---
-st.subheader("Fitted GMM via Expectation-Maximization")
-
-# Hard assignment based on max responsibility gamma_{i,k}
-hard_cluster_assignments = np.argmax(step_data["gamma"], axis=1)
-
-df_em = pd.DataFrame({
-    "x1": X_mat[:, 0],
-    "x2": X_mat[:, 1],
-    "Inferred Cluster": [f"Est. Component {k+1}" for k in hard_cluster_assignments],
-    "Max Responsibility": np.max(step_data["gamma"], axis=1)
-})
-
-tab1, tab2 = st.tabs(["Inferred Soft Assignments (EM View)", "Log-Likelihood Convergence Curve"])
-
-with tab1:
-    fig_em = px.scatter(
-        df_em, x="x1", y="x2", 
-        color="Inferred Cluster", 
-        opacity=0.7,
-        title=f"EM Step {current_step}: Soft-Clustering Points to Highest γ_k"
-    )
-    
-    # Overlay Estimated Means
-    for k in range(K):
-        fig_em.add_trace(go.Scatter(
-            x=[step_data["means"][k][0]], 
-            y=[step_data["means"][k][1]],
-            mode="markers+text",
-            marker=dict(size=16, color="black", symbol="star"),
-            text=[f"μ_hat_{k+1}"], 
-            textposition="top center",
-            name=f"Est. Mean μ_{k+1}"
-        ))
-        
-    st.plotly_chart(fig_em, use_container_width=True)
-
-with tab2:
+with col_ll1:
     ll_series = [h["log_likelihood"] for h in em_history]
     df_ll = pd.DataFrame({"Iteration": list(range(len(ll_series))), "Log-Likelihood": ll_series})
     
     fig_ll = px.line(df_ll, x="Iteration", y="Log-Likelihood", markers=True,
-                     title="Monotonic Convergence of Log-Likelihood Log P(X | θ)")
+                     title="Monotonic Convergence of Log-Likelihood")
     
-    # Highlight current step
+    # Highlight selected iteration
     fig_ll.add_trace(go.Scatter(
         x=[current_step], y=[step_data["log_likelihood"]],
-        mode="markers", marker=dict(size=12, color="red"), name="Current Step"
+        mode="markers", marker=dict(size=14, color="red", symbol="diamond"),
+        name=f"Selected Step ({current_step})"
     ))
-    
     st.plotly_chart(fig_ll, use_container_width=True)
+
+with col_ll2:
+    st.metric("Current Iteration", f"Step {current_step}")
+    st.metric("Current Log-Likelihood", f"{step_data['log_likelihood']:.2f}")
+    if current_step > 0:
+        gain = step_data['log_likelihood'] - em_history[current_step-1]['log_likelihood']
+        st.metric("1-Step Likelihood Improvement", f"+{gain:.4f}")
+    else:
+        st.metric("1-Step Likelihood Improvement", "Baseline")
+
+st.markdown("---")
+
+# --- SECTION 2: COMPARISON (ORIGINAL SAMPLING VS EM RESULT) ---
+st.subheader("2. Visual Comparison: True Generation vs. EM Recovery")
+
+col_left, col_right = st.columns(2)
+
+# LEFT COLUMN: ORIGINAL SAMPLING
+with col_left:
+    st.markdown("#### A. Original Sampling (Ground Truth)")
+    fig_true = px.scatter(
+        df_gen, x="x1", y="x2", color="True Cluster (z_i)",
+        title="True Latent Cluster Assignments z_i", opacity=0.75
+    )
+    # Overlay True Means
+    for k in range(K):
+        fig_true.add_trace(go.Scatter(
+            x=[means_true[k][0]], y=[means_true[k][1]],
+            mode="markers+text",
+            marker=dict(size=14, color="black", symbol="x"),
+            text=[f"True μ_{k+1}"], textposition="top center",
+            name=f"True μ_{k+1}"
+        ))
+    st.plotly_chart(fig_true, use_container_width=True)
+
+# RIGHT COLUMN: RESULT OF EM
+with col_right:
+    st.markdown(f"#### B. Result of EM (At Step {current_step})")
+    
+    hard_assignments = np.argmax(step_data["gamma"], axis=1)
+    df_em = pd.DataFrame({
+        "x1": X_mat[:, 0],
+        "x2": X_mat[:, 1],
+        "Inferred Cluster": [f"Est. Component {k+1}" for k in hard_assignments]
+    })
+    
+    fig_em = px.scatter(
+        df_em, x="x1", y="x2", color="Inferred Cluster",
+        title=f"Inferred Clusters (Max Responsibility γ_{{i,k}})", opacity=0.75
+    )
+    # Overlay Estimated Means
+    for k in range(K):
+        fig_em.add_trace(go.Scatter(
+            x=[step_data["means"][k][0]], y=[step_data["means"][k][1]],
+            mode="markers+text",
+            marker=dict(size=14, color="black", symbol="star"),
+            text=[f"Est. μ_{k+1}"], textposition="top center",
+            name=f"Est. μ_{k+1}"
+        ))
+    st.plotly_chart(fig_em, use_container_width=True)
+
+# --- SECTION 3: PARAMETER COMPARISON TABLE ---
+st.markdown("---")
+st.subheader("3. Parameter Recovery Table (True vs. Estimated)")
+
+param_rows = []
+for k in range(K):
+    param_rows.append({
+        "Component": f"K={k+1}",
+        "True Weight (π)": f"{pi_true[k]:.3f}",
+        "Est Weight (π)": f"{step_data['pi'][k]:.3f}",
+        "True Mean (μ)": f"[{means_true[k][0]:.2f}, {means_true[k][1]:.2f}]",
+        "Est Mean (μ)": f"[{step_data['means'][k][0]:.2f}, {step_data['means'][k][1]:.2f}]"
+    })
+
+st.table(pd.DataFrame(param_rows))
