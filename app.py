@@ -13,7 +13,7 @@ st.set_page_config(
 
 st.title("📊 GMM: Ground Truth Sampling vs. EM Algorithm")
 st.markdown("""
-Compare the **true generative model** against the **Expectation-Maximization (EM)** inference process, and observe how the **incomplete log-likelihood** evolves over iterations.
+Compare the **true generative model** against the **Expectation-Maximization (EM)** inference process, observe how the **incomplete log-likelihood** evolves over iterations, and explore how **covariance constraints** (Spherical, Diagonal, Full) impact cluster fitting.
 """)
 
 # --- SIDEBAR: PARAMETERS ---
@@ -54,6 +54,17 @@ for k in range(K):
     cov = np.array([[std_x**2, cov_xy], [cov_xy, std_y**2]])
     covs_true.append(cov)
 
+st.sidebar.markdown("---")
+st.sidebar.header("3. EM Model Constraints")
+
+# Covariance Type Selection
+cov_type = st.sidebar.selectbox(
+    "EM Covariance Structure",
+    options=["Full", "Diagonal", "Spherical"],
+    index=0,
+    help="• Full: Arbitrary rotation and variances (3 params/component)\n• Diagonal: Axis-aligned variances (2 params/component)\n• Spherical: Equal variances along both axes (1 param/component)"
+)
+
 # --- GENERATION FUNCTION ---
 @st.cache_data(show_spinner=False)
 def generate_gmm_data(N_val, K_val, pi_vec, means_list, covs_list, random_seed):
@@ -74,7 +85,7 @@ def generate_gmm_data(N_val, K_val, pi_vec, means_list, covs_list, random_seed):
 
 df_gen, X_mat, z_true = generate_gmm_data(N, K, pi_true, means_true, covs_true, seed)
 
-# --- EM ALGORITHM IMPLEMENTATION ---
+# --- EM ALGORITHM WITH COVARIANCE CONSTRAINTS ---
 def gaussian_pdf_2d(x, mean, cov):
     d = 2
     det = max(np.linalg.det(cov), 1e-6)
@@ -84,11 +95,10 @@ def gaussian_pdf_2d(x, mean, cov):
     exponent = -0.5 * np.sum(diff @ inv * diff, axis=1)
     return norm_const * np.exp(exponent)
 
-def run_em_steps(X, K, max_iter=25):
+def run_em_steps(X, K, max_iter=25, constraint="Full"):
     N = X.shape[0]
     np.random.seed(seed + 100) # Distinct seed for EM initialization
     
-    # K-Means style or random initial centroids
     pi_hat = np.ones(K) / K
     random_indices = np.random.choice(N, K, replace=False)
     means_hat = X[random_indices].copy()
@@ -97,7 +107,7 @@ def run_em_steps(X, K, max_iter=25):
     history = []
     
     for iteration in range(max_iter):
-        # E-step
+        # E-step: Responsibilities
         gamma = np.zeros((N, K))
         for k in range(K):
             gamma[:, k] = pi_hat[k] * gaussian_pdf_2d(X, means_hat[k], covs_hat[k])
@@ -106,7 +116,6 @@ def run_em_steps(X, K, max_iter=25):
         sum_gamma_safe = np.where(sum_gamma == 0, 1e-10, sum_gamma)
         gamma = gamma / sum_gamma_safe
         
-        # Log-Likelihood
         log_likelihood = np.sum(np.log(sum_gamma_safe))
         
         history.append({
@@ -118,26 +127,39 @@ def run_em_steps(X, K, max_iter=25):
             "log_likelihood": log_likelihood
         })
         
-        # M-step
+        # M-step: Parameter updates
         N_k = np.sum(gamma, axis=0)
         for k in range(K):
             pi_hat[k] = N_k[k] / N
             means_hat[k] = np.sum(gamma[:, k, None] * X, axis=0) / max(N_k[k], 1e-6)
+            
             diff = X - means_hat[k]
-            covs_hat[k] = (diff.T @ (gamma[:, k, None] * diff)) / max(N_k[k], 1e-6)
-            covs_hat[k] += np.eye(2) * 1e-4 # Regularization
+            raw_cov = (diff.T @ (gamma[:, k, None] * diff)) / max(N_k[k], 1e-6)
+            
+            # Apply Covariance Constraint
+            if constraint == "Diagonal":
+                # Zero out off-diagonal elements
+                covs_hat[k] = np.diag(np.diag(raw_cov))
+            elif constraint == "Spherical":
+                # Average diagonal elements across dimensions
+                avg_var = np.mean(np.diag(raw_cov))
+                covs_hat[k] = np.eye(2) * avg_var
+            else: # Full
+                covs_hat[k] = raw_cov
+                
+            covs_hat[k] += np.eye(2) * 1e-4 # Regularization for numerical stability
             
     return history
 
 max_em_steps = st.sidebar.slider("Max EM Iterations", min_value=1, max_value=40, value=20)
-em_history = run_em_steps(X_mat, K, max_iter=max_em_steps)
+em_history = run_em_steps(X_mat, K, max_iter=max_em_steps, constraint=cov_type)
 
 # Select Iteration Step
 current_step = st.slider("Step Through EM Iterations", min_value=0, max_value=len(em_history)-1, value=len(em_history)-1)
 step_data = em_history[current_step]
 
 # --- SECTION 1: LIKELIHOOD EVOLUTION ---
-st.subheader("1. Incomplete Log-Likelihood Evolution: $\\log P(\\mathbf{X} \\mid \\boldsymbol{\\theta})$")
+st.subheader(f"1. Incomplete Log-Likelihood Evolution ({cov_type} Covariances)")
 
 col_ll1, col_ll2 = st.columns([2, 1])
 
@@ -146,9 +168,8 @@ with col_ll1:
     df_ll = pd.DataFrame({"Iteration": list(range(len(ll_series))), "Log-Likelihood": ll_series})
     
     fig_ll = px.line(df_ll, x="Iteration", y="Log-Likelihood", markers=True,
-                     title="Monotonic Convergence of Log-Likelihood")
+                     title=f"Log-Likelihood Convergence Curve ({cov_type} Structure)")
     
-    # Highlight selected iteration
     fig_ll.add_trace(go.Scatter(
         x=[current_step], y=[step_data["log_likelihood"]],
         mode="markers", marker=dict(size=14, color="red", symbol="diamond"),
@@ -157,6 +178,7 @@ with col_ll1:
     st.plotly_chart(fig_ll, use_container_width=True)
 
 with col_ll2:
+    st.metric("Selected Covariance", cov_type)
     st.metric("Current Iteration", f"Step {current_step}")
     st.metric("Current Log-Likelihood", f"{step_data['log_likelihood']:.2f}")
     if current_step > 0:
@@ -179,7 +201,6 @@ with col_left:
         df_gen, x="x1", y="x2", color="True Cluster (z_i)",
         title="True Latent Cluster Assignments z_i", opacity=0.75
     )
-    # Overlay True Means
     for k in range(K):
         fig_true.add_trace(go.Scatter(
             x=[means_true[k][0]], y=[means_true[k][1]],
@@ -192,7 +213,7 @@ with col_left:
 
 # RIGHT COLUMN: RESULT OF EM
 with col_right:
-    st.markdown(f"#### B. Result of EM (At Step {current_step})")
+    st.markdown(f"#### B. Result of EM (Step {current_step}, {cov_type} Covariance)")
     
     hard_assignments = np.argmax(step_data["gamma"], axis=1)
     df_em = pd.DataFrame({
@@ -205,7 +226,6 @@ with col_right:
         df_em, x="x1", y="x2", color="Inferred Cluster",
         title=f"Inferred Clusters (Max Responsibility γ_{{i,k}})", opacity=0.75
     )
-    # Overlay Estimated Means
     for k in range(K):
         fig_em.add_trace(go.Scatter(
             x=[step_data["means"][k][0]], y=[step_data["means"][k][1]],
@@ -222,12 +242,14 @@ st.subheader("3. Parameter Recovery Table (True vs. Estimated)")
 
 param_rows = []
 for k in range(K):
+    est_cov = step_data['covs'][k]
     param_rows.append({
         "Component": f"K={k+1}",
         "True Weight (π)": f"{pi_true[k]:.3f}",
         "Est Weight (π)": f"{step_data['pi'][k]:.3f}",
         "True Mean (μ)": f"[{means_true[k][0]:.2f}, {means_true[k][1]:.2f}]",
-        "Est Mean (μ)": f"[{step_data['means'][k][0]:.2f}, {step_data['means'][k][1]:.2f}]"
+        "Est Mean (μ)": f"[{step_data['means'][k][0]:.2f}, {step_data['means'][k][1]:.2f}]",
+        "Est Covariance Σ": f"[{est_cov[0,0]:.2f}, {est_cov[0,1]:.2f}; {est_cov[1,0]:.2f}, {est_cov[1,1]:.2f}]"
     })
 
 st.table(pd.DataFrame(param_rows))
